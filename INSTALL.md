@@ -1,4 +1,4 @@
-# YouMi Tool Catalog for DSH · 安装说明（v0.2.0）
+# YouMi Tool Catalog for DSH · 安装说明（v0.2.1）
 
 用途：为 DSH 增加「向量语义检索工具目录」：模型通过 `search_tools` 找到工具、`invoke` 调用，
 `catalog_status` 查看健康状态。外部目录形态下可让请求头只保留 2 个元工具。
@@ -17,13 +17,13 @@
 ### A. DSH 插件管理器（推荐）
 
 1. 打开 DSH → **插件（Plugins）→ 添加插件**
-2. 选择本目录（`youmi-dsh-tool-catalog-0.2.0`）
+2. 选择本目录（`youmi-dsh-tool-catalog-0.2.1`）
 3. 安装后**重启 DSH Desktop**（bundle 以 link 安装，JS 模块在启动时加载）
 
 ### B. npm 包安装
 
 ```bash
-npm install ./youmi-dsh-tool-catalog-0.2.0.tgz
+npm install ./youmi-dsh-tool-catalog-0.2.1.tgz
 ```
 
 ## 运行时依赖（必须）
@@ -67,6 +67,8 @@ python scripts/verify_dsh_session.py --session <会话.jsonl.zstd>      # L3 端
 
 ## 版本与限制
 
+- v0.2.1：修正成本口径——未缓存输入 = `prompt_tokens − cached_tokens`（与 provider `prompt_cache_miss_tokens` 一致），改用官方价目；
+  重算后 50 / 200 / 1000 档倍数为 **0.9× / 1.6× / 5.4~6.5×**（flash 空闲），**旧的 4.4× / 16.9× / 84× 作废**
 - v0.2.0：检索按「查询语言 = 工具描述语言」设计（英文实测 19/19 top-1）
 - `external` 形态的 mock 执行器仅供评测，无真实副作用
 - 真实外部执行器（MCP）尚未实现

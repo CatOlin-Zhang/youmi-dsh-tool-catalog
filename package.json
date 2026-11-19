@@ -1,7 +1,7 @@
 {
   "name": "@youmi/dsh-tool-catalog",
   "description": "DSH plugin for YouMi vector-based tool discovery and on-demand presentation",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "type": "module",
   "main": "./index.js",
   "exports": {
