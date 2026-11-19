@@ -1,0 +1,7 @@
+{
+  "meta": {
+    "title": "YouMi 工具目录",
+    "description": "基于向量检索的工具发现：用自然语言搜索全部已注册工具、按需调用、健康检测。",
+    "detail": "docs/DETAIL.md"
+  }
+}

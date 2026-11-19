@@ -1,0 +1,7 @@
+{
+  "meta": {
+    "title": "YouMi Tool Catalog",
+    "description": "Vector-based tool discovery: search all registered tools by natural language, invoke on demand, and monitor health.",
+    "detail": "docs/DETAIL.md"
+  }
+}

@@ -1,0 +1,419 @@
+"""
+工具定义与注册表
+
+ToolDefinition — 工具声明 (name / description / parameters schema)
+ToolRegistry   — 工具注册表，管理工具定义 + 绑定执行函数
+
+用法::
+
+    from youmi.core.tool import ToolDefinition, ToolRegistry
+
+    # 定义工具
+    def get_weather(city: str, unit: str = "celsius") -> str:
+        return f"{city} 的天气是 25°{unit[0].upper()}"
+
+    tool = ToolDefinition.from_function(
+        func=get_weather,
+        description="获取指定城市的天气",
+    )
+
+    # 注册
+    registry = ToolRegistry()
+    registry.register(tool, handler=get_weather)
+
+    # 生成 OpenAI tools 格式
+    tools_schema = registry.to_openai_tools()
+
+    # 执行
+    result = await registry.execute("get_weather", {"city": "北京"})
+"""
+
+from __future__ import annotations
+
+import asyncio
+import inspect
+import json
+import logging
+from typing import Any, Callable, Awaitable
+
+from pydantic import BaseModel, Field
+
+logger = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# 风险级别常量
+# ---------------------------------------------------------------------------
+
+class RiskLevel:
+    """工具风险级别常量 (模块级, 同 protocol.py 错误码风格)
+
+    因 Pydantic BaseModel 不支持类属性常量，风险级别用普通类的
+    字符串常量表示，ToolDefinition.risk_level 存储对应字符串。
+    """
+
+    LOW = "low"            # 只读/无副作用，无需审批
+    MEDIUM = "medium"      # 可逆的写操作
+    HIGH = "high"          # 不可逆或外部可见的操作
+    CRITICAL = "critical"  # 危险操作，召回即需人工审批
+
+
+# 风险级别 → 排序权重 (数值越大风险越高, 用于 SQL/Python 层的锥形裁剪)
+RISK_ORDER: dict[str, int] = {
+    RiskLevel.LOW: 0,
+    RiskLevel.MEDIUM: 1,
+    RiskLevel.HIGH: 2,
+    RiskLevel.CRITICAL: 3,
+}
+
+
+def risk_rank(level: str) -> int:
+    """风险级别 → 排序权重 (未知级别按 low 处理)"""
+    return RISK_ORDER.get(level, 0)
+
+
+# ---------------------------------------------------------------------------
+# 工具定义
+# ---------------------------------------------------------------------------
+
+class ToolParameter(BaseModel):
+    """工具参数描述"""
+
+    name: str
+    type: str = "string"
+    description: str = ""
+    required: bool = True
+    enum: list[str] | None = None
+    default: Any = None
+    items: dict[str, Any] | None = None  # array 类型的元素 schema
+
+
+class ToolDefinition(BaseModel):
+    """工具声明 — 描述一个可被 LLM 调用的工具
+
+    包含名称、描述、参数 schema，用于:
+    1. 生成 OpenAI function calling 的 tools 格式
+    2. 在 ToolRegistry 中查找和校验
+    3. 版本管理与持久化存储
+    """
+
+    name: str = Field(description="工具名称 (唯一标识)")
+    description: str = Field(default="", description="工具功能描述")
+    parameters: list[ToolParameter] = Field(default_factory=list)
+    version: str = Field(
+        default="0.0.1",
+        description=(
+            "语义化版本号 主.次.修订 (见 youmi.core.versioning): "
+            "外部接入默认 1.0.0, 系统自生成默认 0.0.1 候选"
+        ),
+    )
+    language: str = Field(default="python", description="工具实现语言")
+    runtime: str = Field(default="python", description="运行时标识")
+    risk_level: str = Field(
+        default=RiskLevel.LOW,
+        description="风险级别 (low/medium/high/critical), 见 RiskLevel 常量",
+    )
+    required_permissions: list[str] = Field(
+        default_factory=list,
+        description="调用所需权限标识 (如 ['fs:write', 'net:http'], 空=无门槛)",
+    )
+    timeout_s: float | None = Field(
+        default=None,
+        description=(
+            "工具级执行超时（秒）。None 时使用全局默认"
+            "（YOUMI_TOOL_TIMEOUT_S，默认 180s）。"
+            "长任务编排类工具（如 run_sub_agent）应设置更大的独立超时"
+        ),
+    )
+
+    def to_openai_function_schema(self) -> dict[str, Any]:
+        """生成 OpenAI function calling 的 tool 定义"""
+        properties: dict[str, Any] = {}
+        required: list[str] = []
+
+        for param in self.parameters:
+            prop: dict[str, Any] = {
+                "type": param.type,
+                "description": param.description,
+            }
+            if param.enum:
+                prop["enum"] = param.enum
+            if param.items is not None:
+                prop["items"] = param.items
+            properties[param.name] = prop
+            if param.required:
+                required.append(param.name)
+
+        return {
+            "type": "function",
+            "function": {
+                "name": self.name,
+                "description": self.description,
+                "version": self.version,
+                "parameters": {
+                    "type": "object",
+                    "properties": properties,
+                    "required": required,
+                },
+            },
+        }
+
+    @classmethod
+    def from_function(
+        cls,
+        func: Callable,
+        name: str = "",
+        description: str = "",
+        param_descriptions: dict[str, str] | None = None,
+    ) -> "ToolDefinition":
+        """从 Python 函数自动生成 ToolDefinition
+
+        自动提取函数名、docstring、参数类型和默认值。
+
+        Args:
+            func: Python 函数 (同步或异步)
+            name: 工具名称 (默认使用函数名)
+            description: 工具描述 (默认使用 docstring 第一行)
+            param_descriptions: 参数描述映射 {参数名: 描述}
+        """
+        sig = inspect.signature(func)
+        tool_name = name or func.__name__
+
+        # 提取描述: 优先使用传入，否则取 docstring 第一行
+        if not description:
+            doc = inspect.getdoc(func) or ""
+            description = doc.split("\n")[0].strip()
+
+        param_descs = param_descriptions or {}
+        parameters: list[ToolParameter] = []
+
+        for param_name, param in sig.parameters.items():
+            if param_name in ("self", "cls"):
+                continue
+
+            # 类型映射
+            annotation = param.annotation
+            py_type = "string"
+            if annotation is not inspect.Parameter.empty:
+                py_type = _python_type_to_json(annotation)
+
+            # 必填/可选
+            has_default = param.default is not inspect.Parameter.empty
+            is_required = not has_default
+
+            parameters.append(ToolParameter(
+                name=param_name,
+                type=py_type,
+                description=param_descs.get(param_name, ""),
+                required=is_required,
+                default=param.default if has_default else None,
+            ))
+
+        return cls(
+            name=tool_name,
+            description=description,
+            parameters=parameters,
+        )
+
+
+# ---------------------------------------------------------------------------
+# 工具注册表
+# ---------------------------------------------------------------------------
+
+# handler 类型: 同步函数或异步函数
+ToolHandler = Callable[..., Any] | Callable[..., Awaitable[Any]]
+
+
+class ToolRegistry:
+    """工具注册表
+
+    管理工具定义 (ToolDefinition) 和执行函数 (handler) 的映射。
+    提供:
+    - register() — 注册工具
+    - execute() — 执行工具调用
+    - to_openai_tools() — 生成 OpenAI tools schema 列表
+    """
+
+    def __init__(self) -> None:
+        self._definitions: dict[str, ToolDefinition] = {}
+        self._handlers: dict[str, ToolHandler] = {}
+
+    @property
+    def tool_names(self) -> list[str]:
+        return list(self._definitions.keys())
+
+    def register(
+        self,
+        definition: ToolDefinition,
+        handler: ToolHandler,
+    ) -> None:
+        """注册一个工具
+
+        Args:
+            definition: 工具定义
+            handler: 执行函数 (同步或异步)
+        """
+        self._definitions[definition.name] = definition
+        self._handlers[definition.name] = handler
+        logger.debug("Registered tool: %s", definition.name)
+
+    def register_function(
+        self,
+        func: ToolHandler,
+        name: str = "",
+        description: str = "",
+        param_descriptions: dict[str, str] | None = None,
+    ) -> None:
+        """快捷注册: 从函数自动生成定义并注册
+
+        等价于::
+
+            defn = ToolDefinition.from_function(func, name, description)
+            registry.register(defn, handler=func)
+        """
+        defn = ToolDefinition.from_function(
+            func,
+            name=name,
+            description=description,
+            param_descriptions=param_descriptions,
+        )
+        self.register(defn, handler=func)
+
+    def unregister(self, name: str) -> None:
+        """注销工具"""
+        self._definitions.pop(name, None)
+        self._handlers.pop(name, None)
+
+    def get_definition(self, name: str) -> ToolDefinition | None:
+        return self._definitions.get(name)
+
+    def to_openai_tools(self) -> list[dict[str, Any]]:
+        """生成 OpenAI tools 格式的 schema 列表"""
+        return [
+            defn.to_openai_function_schema()
+            for defn in self._definitions.values()
+        ]
+
+    async def execute(self, name: str, arguments: dict[str, Any]) -> Any:
+        """执行工具调用
+
+        Args:
+            name: 工具名称
+            arguments: 参数 (已解析的 dict)
+
+        Returns:
+            工具执行结果
+
+        Raises:
+            KeyError: 工具未注册
+        """
+        handler = self._handlers.get(name)
+        if handler is None:
+            raise KeyError(f"工具 '{name}' 未注册")
+
+        logger.debug("Executing tool '%s' with args: %s", name, arguments)
+
+        if asyncio.iscoroutinefunction(handler):
+            result = await handler(**arguments)
+        else:
+            result = handler(**arguments)
+
+        return result
+
+    def __len__(self) -> int:
+        return len(self._definitions)
+
+    def __contains__(self, name: str) -> bool:
+        return name in self._definitions
+
+    def __repr__(self) -> str:
+        return f"<ToolRegistry tools={self.tool_names}>"
+
+
+# ---------------------------------------------------------------------------
+# 工具版本记录
+# ---------------------------------------------------------------------------
+
+class ToolVersion(BaseModel):
+    """工具版本记录 — 存储在 ToolStore 中的版本树节点
+
+    版本号格式为语义化版本: 主版本号.次版本号.修订号
+    - 主版本号: 不兼容下层的修改
+    - 次版本号: 兼容下层的功能新增
+    - 修订号: 仅修复 bug (含回归修复)
+    - 阶段: 0.x.y = 候选库 (candidate), >= 1.0.0 = 正式库 (stable)
+
+    Args:
+        version: 语义化版本号 (如 "0.0.1")
+        parent_version_id: 父版本的 tool_id (None 表示初始版本)
+        definition_json: ToolDefinition 的 JSON 序列化
+        created_at: 创建时间 ISO 格式
+        changelog: 版本变更说明
+        branch: 所属分支 (Git 版本树; 默认 "main")
+        is_head: 是否为该分支当前 head
+        diff_patch: 与 parent 的结构化 diff (added/removed/changed
+            三段 JSON, 见 youmi.mcp.tool_store._dict_diff)
+        stage: 版本阶段 candidate (候选库) / stable (正式库)
+    """
+
+    version: str
+    parent_version_id: str | None = None
+    definition_json: str = ""
+    created_at: str = ""
+    changelog: str = ""
+    branch: str = "main"
+    is_head: bool = False
+    diff_patch: str = ""
+    stage: str = "candidate"
+
+
+def bump_version(current: str, bump_type: str = "patch") -> str:
+    """语义化版本号自增 (主版本号.次版本号.修订号)
+
+    单纯的位自增; 变更类型 → 位 的业务映射见
+    ``youmi.core.versioning.bump_for`` (0.x 阶段破坏性变更只提升次版本)。
+
+    Args:
+        current: 当前版本号 (如 "1.2.3")
+        bump_type: 自增类型 "patch" (仅修复) | "minor" (兼容新增) |
+            "major" (不兼容下层)
+
+    Returns:
+        新版本号
+    """
+    parts = current.split(".")
+    if len(parts) != 3:
+        return "0.0.1"
+
+    try:
+        major, minor, patch = int(parts[0]), int(parts[1]), int(parts[2])
+    except ValueError:
+        return "0.0.1"
+
+    if bump_type == "major":
+        return f"{major + 1}.0.0"
+    elif bump_type == "minor":
+        return f"{major}.{minor + 1}.0"
+    else:  # patch
+        return f"{major}.{minor}.{patch + 1}"
+
+
+# ---------------------------------------------------------------------------
+# 辅助函数
+# ---------------------------------------------------------------------------
+
+def _python_type_to_json(annotation: Any) -> str:
+    """Python 类型注解 → JSON Schema 类型"""
+    type_map = {
+        str: "string",
+        int: "integer",
+        float: "number",
+        bool: "boolean",
+        list: "array",
+        dict: "object",
+    }
+    # 处理 typing 泛型 (list[str] → "array")
+    origin = getattr(annotation, "__origin__", None)
+    if origin is not None:
+        return type_map.get(origin, "string")
+    return type_map.get(annotation, "string")

@@ -1,0 +1,18 @@
+# cordis.patch.yml — 向宿主配置插入 youmi-tool-catalog 插件条目（T10.1.4）
+#
+# DSH 安装 bundle 时读取本文件，将条目合并到 cordis.config 的 plugins 列表。
+# 卸载时对称移除。
+
+- insert:
+    - id: youmi-tool-catalog
+      name: '@youmi/dsh-tool-catalog'
+      config:
+        pythonCommand: ''
+        dbPath: ''
+        embedModel: intfloat/multilingual-e5-small
+        embedMode: real
+        mode: inject
+        topK: 5
+        minScore: 0.3
+        failOpen: true
+        selfCheckOnStart: true
